@@ -155,3 +155,138 @@ Extract file name and type from a file path.
 
 NODE_CLASS_MAPPINGS.update({"ExtractFileInfo": ExtractFileInfo})
 NODE_DISPLAY_NAME_MAPPINGS.update({"ExtractFileInfo": "Extract File Info"})
+
+
+class LoadImageFromPath:
+    DESCRIPTION = """
+Load an image file from disk and output an IMAGE tensor (B,H,W,C) in 0-1 float.
+- Inputs:
+  - file_path: image path (absolute or relative).
+- Outputs:
+  - image: IMAGE tensor.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"file_path": ("STRING", {"default": "", "multiline": False})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load"
+    CATEGORY = "AigcWorkflowTools"
+
+    def load(self, file_path: str):
+        if not file_path:
+            raise ValueError("file_path cannot be empty.")
+
+        from PIL import Image
+        import numpy as np
+        import torch
+
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Image file not found: {file_path}")
+
+        img = Image.open(path).convert("RGB")
+        arr = np.array(img).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(arr)[None, ...]
+        return (tensor,)
+
+
+class LoadVideoFromPath:
+    DESCRIPTION = """
+Load a video file from disk and output frames + fps.
+- Inputs:
+  - file_path: video path.
+- Outputs:
+  - video: dict with frames tensor (T,H,W,C) in 0-1 float and fps.
+  - fps: float frames per second.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"file_path": ("STRING", {"default": "", "multiline": False})}}
+
+    RETURN_TYPES = ("VIDEO", "FLOAT")
+    RETURN_NAMES = ("video", "fps")
+    FUNCTION = "load"
+    CATEGORY = "AigcWorkflowTools"
+
+    def load(self, file_path: str):
+        if not file_path:
+            raise ValueError("file_path cannot be empty.")
+
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Video file not found: {file_path}")
+
+        try:
+            import imageio.v2 as imageio
+            import numpy as np
+            import torch
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("LoadVideoFromPath requires imageio and torch.") from exc
+
+        reader = imageio.get_reader(path)
+        meta = reader.get_meta_data()
+        fps = float(meta.get("fps", 24.0))
+        frames = []
+        for frame in reader:
+            frames.append(torch.from_numpy(frame.astype(np.float32) / 255.0))
+        if not frames:
+            raise RuntimeError("No frames read from video.")
+        stacked = torch.stack(frames, dim=0)
+        video = {"frames": stacked, "fps": fps}
+        return (video, fps)
+
+
+class LoadAudioFromPath:
+    DESCRIPTION = """
+Load an audio file from disk and output waveform + sample rate.
+- Inputs:
+  - file_path: audio path.
+- Outputs:
+  - audio: waveform tensor (channels, samples).
+  - sample_rate: integer sample rate.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"file_path": ("STRING", {"default": "", "multiline": False})}}
+
+    RETURN_TYPES = ("AUDIO", "INT")
+    RETURN_NAMES = ("audio", "sample_rate")
+    FUNCTION = "load"
+    CATEGORY = "AigcWorkflowTools"
+
+    def load(self, file_path: str):
+        if not file_path:
+            raise ValueError("file_path cannot be empty.")
+
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
+
+        try:
+            import torchaudio
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("LoadAudioFromPath requires torchaudio.") from exc
+
+        waveform, sample_rate = torchaudio.load(path)
+        return (waveform, int(sample_rate))
+
+
+NODE_CLASS_MAPPINGS.update(
+    {
+        "LoadImageFromPath": LoadImageFromPath,
+        "LoadVideoFromPath": LoadVideoFromPath,
+        "LoadAudioFromPath": LoadAudioFromPath,
+    }
+)
+NODE_DISPLAY_NAME_MAPPINGS.update(
+    {
+        "LoadImageFromPath": "Load Image From Path",
+        "LoadVideoFromPath": "Load Video From Path",
+        "LoadAudioFromPath": "Load Audio From Path",
+    }
+)

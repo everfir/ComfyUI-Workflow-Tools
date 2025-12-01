@@ -16,3 +16,18 @@
   输入：`file_path`。  
   输出：`file_name`（文件名），`file_type`（扩展名，不含点；若无扩展名则为空）。
   节点 Info 摘要：从给定路径提取文件名与扩展名，不依赖外部库。
+
+- **Load Image From Path**（分类 `AigcWorkflowTools`）  
+  输入：`file_path`。  
+  输出：`image`（IMAGE，B,H,W,C，0-1 float）。  
+  节点 Info 摘要：用 Pillow 读取图片，转 RGB，归一化并转为 torch 张量。
+
+- **Load Video From Path**（分类 `AigcWorkflowTools`）  
+  输入：`file_path`。  
+  输出：`video`（包含 `frames` 张量 T,H,W,C 与 `fps`），`fps`（FLOAT）。  
+  节点 Info 摘要：用 imageio 读取视频为帧张量（0-1 float），附带 fps；需 `imageio` 与 `torch`。
+
+- **Load Audio From Path**（分类 `AigcWorkflowTools`）  
+  输入：`file_path`。  
+  输出：`audio`（waveform，channels x samples），`sample_rate`（INT）。  
+  节点 Info 摘要：用 torchaudio 读取音频，返回波形与采样率；需 `torchaudio`。
