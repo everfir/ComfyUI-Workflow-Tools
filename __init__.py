@@ -177,6 +177,27 @@ def _public_url(endpoint: str, bucket: str, object_key: str) -> str:
     return f"{scheme}://{bucket}.{host}/{object_key.lstrip('/')}"
 
 
+def _put_object_compat(client, bucket: str, object_key: str, data: bytes, content_type: str | None = None):
+    """Try multiple call signatures to adapt to different tos SDK versions."""
+    attempts = [
+        {"args": (bucket, object_key), "kwargs": {"data": data, "content_type": content_type}},
+        {"args": (bucket, object_key), "kwargs": {"content": data, "content_type": content_type}},
+        {"args": (bucket, object_key, data), "kwargs": {"content_type": content_type}},
+        {"args": (bucket, object_key), "kwargs": {"body": data, "content_type": content_type}},
+        {"args": (bucket, object_key, data), "kwargs": {}},
+    ]
+    last_error: Exception | None = None
+    for attempt in attempts:
+        try:
+            return client.put_object(*attempt["args"], **{k: v for k, v in attempt["kwargs"].items() if v is not None})
+        except TypeError as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("put_object failed without TypeError.")
+
+
 class LoadImageFromPath:
     DESCRIPTION = """
 Load an image file from disk and output an IMAGE tensor (B,H,W,C) in 0-1 float.
@@ -375,7 +396,7 @@ Upload an IMAGE tensor to Volcengine TOS and return the public/object URL.
 
         object_key = f"{upload_dir.strip('/')}/{uuid.uuid4().hex}.png"
         client, ep = _tos_client(ak, sk, region, endpoint or None)
-        client.put_object(bucket, object_key, data=data, content_type="image/png")
+        _put_object_compat(client, bucket, object_key, data=data, content_type="image/png")
         url = _public_url(ep, bucket, object_key)
         return (url, object_key)
 
@@ -449,7 +470,7 @@ Upload a VIDEO dict (frames + fps) to Volcengine TOS as MP4 and return the URL.
 
         object_key = f"{upload_dir.strip('/')}/{uuid.uuid4().hex}.mp4"
         client, ep = _tos_client(ak, sk, region, endpoint or None)
-        client.put_object(bucket, object_key, data=data, content_type="video/mp4")
+        _put_object_compat(client, bucket, object_key, data=data, content_type="video/mp4")
         url = _public_url(ep, bucket, object_key)
         return (url, object_key)
 
@@ -515,7 +536,7 @@ Upload an AUDIO tensor to Volcengine TOS as WAV and return the URL.
 
         object_key = f"{upload_dir.strip('/')}/{uuid.uuid4().hex}.wav"
         client, ep = _tos_client(ak, sk, region, endpoint or None)
-        client.put_object(bucket, object_key, data=data, content_type="audio/wav")
+        _put_object_compat(client, bucket, object_key, data=data, content_type="audio/wav")
         url = _public_url(ep, bucket, object_key)
         return (url, object_key)
 
