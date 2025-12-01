@@ -1,0 +1,7 @@
+# Dependencies for ComfyUI-Workflow-Tools nodes
+# Torch is provided by ComfyUI; install torchaudio matching your torch build.
+tos
+pillow
+numpy
+imageio[ffmpeg]
+torchaudio

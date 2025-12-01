@@ -31,3 +31,20 @@
   输入：`file_path`。  
   输出：`audio`（waveform，channels x samples），`sample_rate`（INT）。  
   节点 Info 摘要：用 torchaudio 读取音频，返回波形与采样率；需 `torchaudio`。
+
+- **Upload Image To TOS**（分类 `AigcWorkflowTools`）  
+  输入：`image`，`ak`，`sk`，`region`，`bucket`，`upload_dir`（默认 `uploads/images`），可选 `endpoint`。  
+  输出：`url`，`object_key`。  
+  节点 Info 摘要：将 IMAGE 张量转 PNG 上传至火山引擎 TOS，默认 endpoint `https://tos-{region}.volces.com`，生成 UUID 文件名；需 `tos` SDK、`torch`、`Pillow`。
+
+- **Upload Video To TOS**（分类 `AigcWorkflowTools`）  
+  输入：`video`（含 frames 与 fps），`ak`，`sk`，`region`，`bucket`，`upload_dir`（默认 `uploads/videos`），可选 `endpoint`。  
+  输出：`url`，`object_key`。  
+  节点 Info 摘要：将 VIDEO 帧编码为 MP4 上传 TOS；需 `tos` SDK、`torch`、`numpy`、`imageio`（含 ffmpeg）。
+
+- **Upload Audio To TOS**（分类 `AigcWorkflowTools`）  
+  输入：`audio`（waveform），`sample_rate`，`ak`，`sk`，`region`，`bucket`，`upload_dir`（默认 `uploads/audios`），可选 `endpoint`。  
+  输出：`url`，`object_key`。  
+  节点 Info 摘要：将 AUDIO 保存为 WAV 上传 TOS；需 `tos` SDK、`torch`、`torchaudio`。
+
+依赖提示：如缺少 `tos`（TOS Python SDK）、`imageio`、`torchaudio` 等，请在 ComfyUI 环境安装对应库后使用。

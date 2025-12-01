@@ -1,7 +1,9 @@
 import contextlib
+import io
 import mimetypes
 import re
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -157,6 +159,23 @@ NODE_CLASS_MAPPINGS.update({"ExtractFileInfo": ExtractFileInfo})
 NODE_DISPLAY_NAME_MAPPINGS.update({"ExtractFileInfo": "Extract File Info"})
 
 
+def _tos_client(ak: str, sk: str, region: str, endpoint: str | None = None):
+    try:
+        from tos import TosClientV2
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing dependency: tos. Install with `pip install tos`.") from exc
+
+    ep = endpoint or f"https://tos-{region}.volces.com"
+    return TosClientV2(ak, sk, region, endpoint=ep), ep
+
+
+def _public_url(endpoint: str, bucket: str, object_key: str) -> str:
+    parsed = urlparse(endpoint)
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc or endpoint.replace("https://", "").replace("http://", "")
+    return f"{scheme}://{bucket}.{host}/{object_key.lstrip('/')}"
+
+
 class LoadImageFromPath:
     DESCRIPTION = """
 Load an image file from disk and output an IMAGE tensor (B,H,W,C) in 0-1 float.
@@ -288,5 +307,229 @@ NODE_DISPLAY_NAME_MAPPINGS.update(
         "LoadImageFromPath": "Load Image From Path",
         "LoadVideoFromPath": "Load Video From Path",
         "LoadAudioFromPath": "Load Audio From Path",
+    }
+)
+
+
+class UploadImageToTOS:
+    DESCRIPTION = """
+Upload an IMAGE tensor to Volcengine TOS and return the public/object URL.
+- Inputs:
+  - image: IMAGE tensor (B,H,W,C in 0-1 float).
+  - ak / sk / region / bucket: TOS credentials.
+  - upload_dir: object key prefix (e.g., uploads/images); default creates a UUID name.
+  - endpoint: optional custom endpoint (default: https://tos-{region}.volces.com).
+- Outputs:
+  - url: public-style URL (requires bucket/object ACL to be readable).
+  - object_key: key used in the bucket.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "ak": ("STRING", {"default": "", "multiline": False}),
+                "sk": ("STRING", {"default": "", "multiline": False}),
+                "region": ("STRING", {"default": "", "multiline": False}),
+                "bucket": ("STRING", {"default": "", "multiline": False}),
+                "upload_dir": ("STRING", {"default": "uploads/images", "multiline": False}),
+            },
+            "optional": {"endpoint": ("STRING", {"default": "", "multiline": False})},
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("url", "object_key")
+    FUNCTION = "upload"
+    CATEGORY = "AigcWorkflowTools"
+
+    def upload(self, image, ak: str, sk: str, region: str, bucket: str, upload_dir: str, endpoint: str = ""):
+        if image is None:
+            raise ValueError("image cannot be empty.")
+        if not all([ak, sk, region, bucket]):
+            raise ValueError("ak, sk, region, bucket are required.")
+
+        try:
+            import torch
+            from PIL import Image
+            import numpy as np
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("UploadImageToTOS requires torch and pillow.") from exc
+
+        arr = image
+        if isinstance(image, torch.Tensor):
+            arr = image
+        else:
+            raise TypeError("image must be a torch.Tensor.")
+
+        arr = arr[0] if arr.dim() == 4 else arr
+        arr = arr.clamp(0, 1).cpu()
+        np_img = (arr.numpy() * 255).astype(np.uint8)
+        pil_img = Image.fromarray(np_img)
+
+        buffer = io.BytesIO()
+        pil_img.save(buffer, format="PNG")
+        buffer.seek(0)
+        data = buffer.read()
+
+        object_key = f"{upload_dir.strip('/')}/{uuid.uuid4().hex}.png"
+        client, ep = _tos_client(ak, sk, region, endpoint or None)
+        client.put_object(bucket, object_key, data=data, content_type="image/png")
+        url = _public_url(ep, bucket, object_key)
+        return (url, object_key)
+
+
+class UploadVideoToTOS:
+    DESCRIPTION = """
+Upload a VIDEO dict (frames + fps) to Volcengine TOS as MP4 and return the URL.
+- Inputs:
+  - video: dict with frames tensor (T,H,W,C, 0-1 float) and fps.
+  - ak / sk / region / bucket: TOS credentials.
+  - upload_dir: object key prefix; default creates UUID name.
+  - endpoint: optional custom endpoint.
+- Outputs:
+  - url: public-style URL (requires bucket/object ACL to be readable).
+  - object_key: key used in the bucket.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "ak": ("STRING", {"default": "", "multiline": False}),
+                "sk": ("STRING", {"default": "", "multiline": False}),
+                "region": ("STRING", {"default": "", "multiline": False}),
+                "bucket": ("STRING", {"default": "", "multiline": False}),
+                "upload_dir": ("STRING", {"default": "uploads/videos", "multiline": False}),
+            },
+            "optional": {"endpoint": ("STRING", {"default": "", "multiline": False})},
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("url", "object_key")
+    FUNCTION = "upload"
+    CATEGORY = "AigcWorkflowTools"
+
+    def upload(self, video, ak: str, sk: str, region: str, bucket: str, upload_dir: str, endpoint: str = ""):
+        if video is None:
+            raise ValueError("video cannot be empty.")
+        if not all([ak, sk, region, bucket]):
+            raise ValueError("ak, sk, region, bucket are required.")
+        try:
+            import torch
+            import numpy as np
+            import imageio.v2 as imageio
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("UploadVideoToTOS requires torch, numpy, and imageio (with ffmpeg).") from exc
+
+        frames = video.get("frames")
+        fps = float(video.get("fps", 24.0))
+        if frames is None:
+            raise ValueError("video.frames is missing.")
+        if not isinstance(frames, torch.Tensor):
+            raise TypeError("video.frames must be a torch.Tensor.")
+
+        arr = frames.clamp(0, 1).cpu().numpy()
+        arr_uint8 = (arr * 255).astype(np.uint8)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with imageio.get_writer(tmp_path, fps=fps) as writer:
+                for frame in arr_uint8:
+                    writer.append_data(frame)
+
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+        object_key = f"{upload_dir.strip('/')}/{uuid.uuid4().hex}.mp4"
+        client, ep = _tos_client(ak, sk, region, endpoint or None)
+        client.put_object(bucket, object_key, data=data, content_type="video/mp4")
+        url = _public_url(ep, bucket, object_key)
+        return (url, object_key)
+
+
+class UploadAudioToTOS:
+    DESCRIPTION = """
+Upload an AUDIO tensor to Volcengine TOS as WAV and return the URL.
+- Inputs:
+  - audio: waveform tensor (channels, samples).
+  - sample_rate: integer sample rate.
+  - ak / sk / region / bucket: TOS credentials.
+  - upload_dir: object key prefix; default creates UUID name.
+  - endpoint: optional custom endpoint.
+- Outputs:
+  - url: public-style URL (requires bucket/object ACL to be readable).
+  - object_key: key used in the bucket.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "sample_rate": ("INT", {"default": 16000, "min": 1, "max": 96000}),
+                "ak": ("STRING", {"default": "", "multiline": False}),
+                "sk": ("STRING", {"default": "", "multiline": False}),
+                "region": ("STRING", {"default": "", "multiline": False}),
+                "bucket": ("STRING", {"default": "", "multiline": False}),
+                "upload_dir": ("STRING", {"default": "uploads/audios", "multiline": False}),
+            },
+            "optional": {"endpoint": ("STRING", {"default": "", "multiline": False})},
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("url", "object_key")
+    FUNCTION = "upload"
+    CATEGORY = "AigcWorkflowTools"
+
+    def upload(self, audio, sample_rate: int, ak: str, sk: str, region: str, bucket: str, upload_dir: str, endpoint: str = ""):
+        if audio is None:
+            raise ValueError("audio cannot be empty.")
+        if not all([ak, sk, region, bucket]):
+            raise ValueError("ak, sk, region, bucket are required.")
+
+        try:
+            import torch
+            import torchaudio
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("UploadAudioToTOS requires torch and torchaudio.") from exc
+
+        if not isinstance(audio, torch.Tensor):
+            raise TypeError("audio must be a torch.Tensor.")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            torchaudio.save(tmp_path, audio.cpu(), sample_rate=sample_rate)
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+        object_key = f"{upload_dir.strip('/')}/{uuid.uuid4().hex}.wav"
+        client, ep = _tos_client(ak, sk, region, endpoint or None)
+        client.put_object(bucket, object_key, data=data, content_type="audio/wav")
+        url = _public_url(ep, bucket, object_key)
+        return (url, object_key)
+
+
+NODE_CLASS_MAPPINGS.update(
+    {
+        "UploadImageToTOS": UploadImageToTOS,
+        "UploadVideoToTOS": UploadVideoToTOS,
+        "UploadAudioToTOS": UploadAudioToTOS,
+    }
+)
+NODE_DISPLAY_NAME_MAPPINGS.update(
+    {
+        "UploadImageToTOS": "Upload Image To TOS",
+        "UploadVideoToTOS": "Upload Video To TOS",
+        "UploadAudioToTOS": "Upload Audio To TOS",
     }
 )
