@@ -166,7 +166,8 @@ def _tos_client(ak: str, sk: str, region: str, endpoint: str | None = None):
         raise RuntimeError("Missing dependency: tos. Install with `pip install tos`.") from exc
 
     ep = endpoint or f"https://tos-{region}.volces.com"
-    return TosClientV2(ak, sk, region, endpoint=ep), ep
+    # Use keyword args to avoid positional/keyword conflicts across SDK versions
+    return TosClientV2(ak, sk, region=region, endpoint=ep), ep
 
 
 def _public_url(endpoint: str, bucket: str, object_key: str) -> str:
