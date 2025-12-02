@@ -3,6 +3,10 @@
 把整个 `ComfyUI-Workflow-Tools` 放入 `ComfyUI/custom_nodes`，重启后即可使用其中的节点。
 
 目前包含：
+- **API Text Output**（分类 `AigcWorkflowTools`）  
+  输入：`text`（STRING，forceInput，需连接其他节点）。  
+  输出：`text`（STRING）。  
+  节点 Info 摘要：输出节点，将字符串写入 UI/API 返回的 history `ui.text`，便于 API 直接取文本。
 - **Download URL**（分类 `AigcWorkflowTools`）  
   输入：`url`（HTTP/HTTPS），`save_dir`（默认 `output`，相对路径基于 ComfyUI 工作目录）。  
   输出：`file_path`（绝对路径）。  

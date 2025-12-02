@@ -159,6 +159,33 @@ NODE_CLASS_MAPPINGS.update({"ExtractFileInfo": ExtractFileInfo})
 NODE_DISPLAY_NAME_MAPPINGS.update({"ExtractFileInfo": "Extract File Info"})
 
 
+class APITextOutput:
+    DESCRIPTION = """
+Output node to send plain text back to ComfyUI UI/API responses.
+- Inputs:
+  - text: string content to return.
+- Outputs:
+  - text: same string, also attached to UI history (ui.text).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text": ("STRING", {"forceInput": True})}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "notify_api"
+    CATEGORY = "AigcWorkflowTools"
+    OUTPUT_NODE = True
+
+    def notify_api(self, text: str):
+        return {"ui": {"text": [text]}, "result": (text,)}
+
+
+NODE_CLASS_MAPPINGS.update({"APITextOutput": APITextOutput})
+NODE_DISPLAY_NAME_MAPPINGS.update({"APITextOutput": "API Text Output"})
+
+
 def _tos_client(ak: str, sk: str, region: str, endpoint: str | None = None):
     try:
         from tos import TosClientV2
