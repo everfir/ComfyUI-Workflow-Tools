@@ -179,7 +179,8 @@ Output node to send plain text back to ComfyUI UI/API responses.
     OUTPUT_NODE = True
 
     def notify_api(self, text: str):
-        return {"ui": {"text": [text]}, "result": (text,)}
+        # Return plain string in UI payload instead of a single-item list.
+        return {"ui": {"text": text}, "result": (text,)}
 
 
 NODE_CLASS_MAPPINGS.update({"APITextOutput": APITextOutput})
