@@ -583,3 +583,70 @@ NODE_DISPLAY_NAME_MAPPINGS.update(
         "UploadAudioToTOS": "Upload Audio To TOS",
     }
 )
+
+
+class FFmpegExecutor:
+    DESCRIPTION = """
+Execute FFmpeg command and return the output file path.
+- Inputs:
+  - command: FFmpeg command string to execute (e.g., "ffmpeg -i input.mp4 -vf scale=1280:720 output.mp4").
+  - output_file: path to the expected output file (required to verify and return).
+- Outputs:
+  - file_path: path to the generated output file.
+- Behavior:
+  - Executes the FFmpeg command using subprocess with 10-minute timeout.
+  - Verifies the output file exists after execution.
+  - Returns the absolute path to the output file.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "command": ("STRING", {"default": "", "multiline": True}),
+                "output_file": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_path",)
+    FUNCTION = "execute"
+    CATEGORY = "AigcWorkflowTools"
+
+    def execute(self, command: str, output_file: str):
+        if not command:
+            raise ValueError("FFmpeg command cannot be empty.")
+        if not output_file:
+            raise ValueError("output_file cannot be empty.")
+
+        import subprocess
+
+        # Execute the FFmpeg command
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=600  # 10 minutes timeout
+            )
+        except subprocess.CalledProcessError as exc:
+            error_msg = exc.stderr if exc.stderr else exc.stdout
+            raise RuntimeError(f"FFmpeg command failed with code {exc.returncode}: {error_msg}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("FFmpeg command timed out after 10 minutes.") from exc
+
+        # Verify output file exists
+        output_path = Path(output_file).expanduser()
+        if not output_path.is_absolute():
+            output_path = Path.cwd() / output_path
+
+        if not output_path.exists():
+            raise FileNotFoundError(f"Output file not found after FFmpeg execution: {output_path}")
+
+        return (str(output_path),)
+
+
+NODE_CLASS_MAPPINGS.update({"FFmpegExecutor": FFmpegExecutor})
+NODE_DISPLAY_NAME_MAPPINGS.update({"FFmpegExecutor": "FFmpeg Executor"})
