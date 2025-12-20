@@ -590,13 +590,15 @@ class FFmpegExecutor:
 Execute FFmpeg command and return the output file path.
 - Inputs:
   - command: FFmpeg command string to execute (e.g., "ffmpeg -i input.mp4 -vf scale=1280:720 output.mp4").
-  - output_file: path to the expected output file (required to verify and return).
+  - output_dir: directory for output files (default: output, relative to ComfyUI working dir).
+  - output_file: optional explicit output file path; if empty, auto-extracts from command.
 - Outputs:
-  - file_path: path to the generated output file.
+  - file_path: absolute path to the generated output file.
 - Behavior:
   - Executes the FFmpeg command using subprocess with 10-minute timeout.
+  - Auto-extracts output file from command if output_file is empty.
+  - If extracted path is relative, joins with output_dir.
   - Verifies the output file exists after execution.
-  - Returns the absolute path to the output file.
     """
 
     @classmethod
@@ -604,6 +606,9 @@ Execute FFmpeg command and return the output file path.
         return {
             "required": {
                 "command": ("STRING", {"default": "", "multiline": True}),
+                "output_dir": ("STRING", {"default": "output", "multiline": False}),
+            },
+            "optional": {
                 "output_file": ("STRING", {"default": "", "multiline": False}),
             }
         }
@@ -613,13 +618,27 @@ Execute FFmpeg command and return the output file path.
     FUNCTION = "execute"
     CATEGORY = "AigcWorkflowTools"
 
-    def execute(self, command: str, output_file: str):
+    def execute(self, command: str, output_dir: str, output_file: str = ""):
         if not command:
             raise ValueError("FFmpeg command cannot be empty.")
-        if not output_file:
-            raise ValueError("output_file cannot be empty.")
 
         import subprocess
+        import shlex
+
+        # Auto-extract output file from command if not provided
+        if not output_file:
+            output_file = self._extract_output_file(command)
+            if not output_file:
+                raise ValueError("Cannot auto-extract output file from command. Please provide output_file explicitly.")
+
+        # Resolve output path
+        output_path = Path(output_file).expanduser()
+        if not output_path.is_absolute():
+            target_dir = Path(output_dir).expanduser()
+            if not target_dir.is_absolute():
+                target_dir = Path.cwd() / target_dir
+            output_path = target_dir / output_file
+            output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Execute the FFmpeg command
         try:
@@ -638,15 +657,261 @@ Execute FFmpeg command and return the output file path.
             raise RuntimeError("FFmpeg command timed out after 10 minutes.") from exc
 
         # Verify output file exists
-        output_path = Path(output_file).expanduser()
-        if not output_path.is_absolute():
-            output_path = Path.cwd() / output_path
-
         if not output_path.exists():
             raise FileNotFoundError(f"Output file not found after FFmpeg execution: {output_path}")
 
         return (str(output_path),)
 
+    def _extract_output_file(self, command: str) -> str:
+        """Extract the output file path from FFmpeg command."""
+        import shlex
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+
+        # Look for the last non-option argument (typically the output file)
+        # Skip arguments that start with - or are right after known options
+        skip_next = False
+        candidates = []
+        option_with_value = {'-i', '-vf', '-af', '-filter_complex', '-c:v', '-c:a', '-b:v', '-b:a',
+                            '-r', '-s', '-pix_fmt', '-ar', '-ac', '-t', '-ss', '-to', '-map',
+                            '-metadata', '-f', '-codec', '-preset', '-crf', '-qscale'}
+
+        for i, part in enumerate(parts):
+            if skip_next:
+                skip_next = False
+                continue
+            if part.startswith('-'):
+                # Check if this option takes a value
+                if part in option_with_value or '=' not in part:
+                    skip_next = True
+                continue
+            # This is a potential file argument
+            if i > 0:  # Skip the first part (ffmpeg executable)
+                candidates.append(part)
+
+        # Return the last candidate (output file)
+        return candidates[-1] if candidates else ""
+
 
 NODE_CLASS_MAPPINGS.update({"FFmpegExecutor": FFmpegExecutor})
 NODE_DISPLAY_NAME_MAPPINGS.update({"FFmpegExecutor": "FFmpeg Executor"})
+
+
+class UploadFileToTOS:
+    DESCRIPTION = """
+Upload various file types to Volcengine TOS and return the public URL.
+- Inputs (required):
+  - ak / sk / region / bucket: TOS credentials.
+  - upload_dir: object key prefix (e.g., "uploads/videos").
+- Inputs (optional, at least one):
+  - image: IMAGE tensor (B,H,W,C in 0-1 float).
+  - video: VIDEO dict with frames and fps.
+  - audio: AUDIO waveform tensor (channels, samples).
+  - sample_rate: INT sample rate (required when audio is provided).
+  - file_path: STRING path to local file.
+- Inputs (optional config):
+  - endpoint: custom endpoint (default: https://tos-{region}.volces.com).
+  - acl: access control (public-read/private/public-read-write).
+  - storage_class: storage type (STANDARD/IA/ARCHIVE_FR).
+  - content_type: custom Content-Type (auto-detected if empty).
+  - custom_filename: custom filename without extension (uses UUID if empty).
+- Outputs:
+  - url: public-style URL (requires bucket/object ACL to be readable).
+  - object_key: key used in the bucket.
+- Behavior:
+  - Priority: file_path > image > video > audio
+  - Auto-detects content type and extension based on input type
+  - Supports ACL and storage class configuration
+  - Returns both public URL and object key
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ak": ("STRING", {"default": "", "multiline": False}),
+                "sk": ("STRING", {"default": "", "multiline": False}),
+                "region": ("STRING", {"default": "", "multiline": False}),
+                "bucket": ("STRING", {"default": "", "multiline": False}),
+                "upload_dir": ("STRING", {"default": "uploads", "multiline": False}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "video": ("VIDEO",),
+                "audio": ("AUDIO",),
+                "sample_rate": ("INT", {"default": 16000, "min": 1, "max": 96000}),
+                "file_path": ("STRING", {"default": "", "multiline": False}),
+                "endpoint": ("STRING", {"default": "", "multiline": False}),
+                "acl": (["", "public-read", "private", "public-read-write"], {"default": ""}),
+                "storage_class": (["", "STANDARD", "IA", "ARCHIVE_FR"], {"default": ""}),
+                "content_type": ("STRING", {"default": "", "multiline": False}),
+                "custom_filename": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("url", "object_key")
+    FUNCTION = "upload"
+    CATEGORY = "AigcWorkflowTools"
+
+    def upload(self, ak: str, sk: str, region: str, bucket: str, upload_dir: str,
+               image=None, video=None, audio=None, sample_rate: int = 16000,
+               file_path: str = "", endpoint: str = "", acl: str = "",
+               storage_class: str = "", content_type: str = "", custom_filename: str = ""):
+
+        if not all([ak, sk, region, bucket]):
+            raise ValueError("ak, sk, region, bucket are required.")
+
+        # Determine input type and prepare data
+        data, detected_content_type, extension = self._prepare_data(
+            image, video, audio, sample_rate, file_path
+        )
+
+        # Use custom content_type if provided, otherwise use detected
+        final_content_type = content_type or detected_content_type
+
+        # Generate object key
+        filename = custom_filename or uuid.uuid4().hex
+        object_key = f"{upload_dir.strip('/')}/{filename}{extension}"
+
+        # Create TOS client
+        client, ep = _tos_client(ak, sk, region, endpoint or None)
+
+        # Prepare upload kwargs
+        upload_kwargs = {"data": data, "content_type": final_content_type}
+
+        # Add optional parameters if provided
+        if acl:
+            upload_kwargs["acl"] = acl
+        if storage_class:
+            upload_kwargs["storage_class"] = storage_class
+
+        # Upload to TOS using compatibility wrapper
+        try:
+            _put_object_compat(client, bucket, object_key, **upload_kwargs)
+        except Exception as exc:
+            # Try setting ACL separately if it failed during upload
+            if acl:
+                try:
+                    _put_object_compat(client, bucket, object_key,
+                                     data=data, content_type=final_content_type)
+                    # Set ACL separately (if SDK supports it)
+                    with contextlib.suppress(Exception):
+                        client.put_object_acl(bucket, object_key, acl=acl)
+                except Exception:
+                    raise exc
+            else:
+                raise exc
+
+        # Generate public URL
+        url = _public_url(ep, bucket, object_key)
+        return (url, object_key)
+
+    def _prepare_data(self, image, video, audio, sample_rate: int, file_path: str):
+        """Prepare upload data based on input type. Returns (data, content_type, extension)."""
+
+        # Priority 1: file_path
+        if file_path:
+            path = Path(file_path)
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+            with open(path, "rb") as f:
+                data = f.read()
+
+            # Auto-detect content type
+            content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+            extension = path.suffix or ".bin"
+            return data, content_type, extension
+
+        # Priority 2: image
+        if image is not None:
+            try:
+                import torch
+                from PIL import Image
+                import numpy as np
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("Image upload requires torch and pillow.") from exc
+
+            arr = image
+            if isinstance(image, torch.Tensor):
+                arr = image
+            else:
+                raise TypeError("image must be a torch.Tensor.")
+
+            arr = arr[0] if arr.dim() == 4 else arr
+            arr = arr.clamp(0, 1).cpu()
+            np_img = (arr.numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(np_img)
+
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format="PNG")
+            buffer.seek(0)
+            data = buffer.read()
+
+            return data, "image/png", ".png"
+
+        # Priority 3: video
+        if video is not None:
+            try:
+                import torch
+                import numpy as np
+                import imageio.v2 as imageio
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("Video upload requires torch, numpy, and imageio (with ffmpeg).") from exc
+
+            frames = video.get("frames")
+            fps = float(video.get("fps", 24.0))
+            if frames is None:
+                raise ValueError("video.frames is missing.")
+            if not isinstance(frames, torch.Tensor):
+                raise TypeError("video.frames must be a torch.Tensor.")
+
+            arr = frames.clamp(0, 1).cpu().numpy()
+            arr_uint8 = (arr * 255).astype(np.uint8)
+
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                with imageio.get_writer(tmp_path, fps=fps) as writer:
+                    for frame in arr_uint8:
+                        writer.append_data(frame)
+
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+
+            return data, "video/mp4", ".mp4"
+
+        # Priority 4: audio
+        if audio is not None:
+            try:
+                import torch
+                import torchaudio
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("Audio upload requires torch and torchaudio.") from exc
+
+            if not isinstance(audio, torch.Tensor):
+                raise TypeError("audio must be a torch.Tensor.")
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                torchaudio.save(tmp_path, audio.cpu(), sample_rate=sample_rate)
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+
+            return data, "audio/wav", ".wav"
+
+        raise ValueError("At least one input (image, video, audio, or file_path) must be provided.")
+
+
+NODE_CLASS_MAPPINGS.update({"UploadFileToTOS": UploadFileToTOS})
+NODE_DISPLAY_NAME_MAPPINGS.update({"UploadFileToTOS": "Upload File To TOS"})
