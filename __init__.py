@@ -589,16 +589,17 @@ class FFmpegExecutor:
     DESCRIPTION = """
 Execute FFmpeg command and return the output file path.
 - Inputs:
-  - command: FFmpeg command string to execute (e.g., "ffmpeg -i input.mp4 -vf scale=1280:720 output.mp4").
+  - command: FFmpeg command WITHOUT output file (e.g., "ffmpeg -i input.mp4 -vf scale=1280:720").
   - output_dir: directory for output files (default: output, relative to ComfyUI working dir).
-  - output_file: optional explicit output file path; if empty, auto-extracts from command.
+  - output_filename: output filename without extension (default: UUID).
+  - output_extension: output file extension (default: .mp4).
 - Outputs:
   - file_path: absolute path to the generated output file.
 - Behavior:
-  - Executes the FFmpeg command using subprocess with 10-minute timeout.
-  - Auto-extracts output file from command if output_file is empty.
-  - If extracted path is relative, joins with output_dir.
-  - Verifies the output file exists after execution.
+  - Appends the full output path to the FFmpeg command.
+  - Creates output directory if it doesn't exist.
+  - Executes FFmpeg with 10-minute timeout.
+  - Verifies output file exists and returns absolute path.
     """
 
     @classmethod
@@ -607,9 +608,10 @@ Execute FFmpeg command and return the output file path.
             "required": {
                 "command": ("STRING", {"default": "", "multiline": True}),
                 "output_dir": ("STRING", {"default": "output", "multiline": False}),
+                "output_extension": ("STRING", {"default": ".mp4", "multiline": False}),
             },
             "optional": {
-                "output_file": ("STRING", {"default": "", "multiline": False}),
+                "output_filename": ("STRING", {"default": "", "multiline": False}),
             }
         }
 
@@ -618,32 +620,36 @@ Execute FFmpeg command and return the output file path.
     FUNCTION = "execute"
     CATEGORY = "AigcWorkflowTools"
 
-    def execute(self, command: str, output_dir: str, output_file: str = ""):
+    def execute(self, command: str, output_dir: str, output_extension: str, output_filename: str = ""):
         if not command:
             raise ValueError("FFmpeg command cannot be empty.")
 
         import subprocess
         import shlex
 
-        # Auto-extract output file from command if not provided
-        if not output_file:
-            output_file = self._extract_output_file(command)
-            if not output_file:
-                raise ValueError("Cannot auto-extract output file from command. Please provide output_file explicitly.")
+        # Generate output filename if not provided
+        if not output_filename:
+            output_filename = uuid.uuid4().hex
 
-        # Resolve output path
-        output_path = Path(output_file).expanduser()
-        if not output_path.is_absolute():
-            target_dir = Path(output_dir).expanduser()
-            if not target_dir.is_absolute():
-                target_dir = Path.cwd() / target_dir
-            output_path = target_dir / output_file
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure extension starts with dot
+        if output_extension and not output_extension.startswith('.'):
+            output_extension = '.' + output_extension
+
+        # Build full output path
+        target_dir = Path(output_dir).expanduser()
+        if not target_dir.is_absolute():
+            target_dir = Path.cwd() / target_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        output_path = target_dir / f"{output_filename}{output_extension}"
+
+        # Append output path to command
+        full_command = f"{command} {shlex.quote(str(output_path))}"
 
         # Execute the FFmpeg command
         try:
             result = subprocess.run(
-                command,
+                full_command,
                 shell=True,
                 check=True,
                 capture_output=True,
@@ -661,38 +667,6 @@ Execute FFmpeg command and return the output file path.
             raise FileNotFoundError(f"Output file not found after FFmpeg execution: {output_path}")
 
         return (str(output_path),)
-
-    def _extract_output_file(self, command: str) -> str:
-        """Extract the output file path from FFmpeg command."""
-        import shlex
-        try:
-            parts = shlex.split(command)
-        except ValueError:
-            parts = command.split()
-
-        # Look for the last non-option argument (typically the output file)
-        # Skip arguments that start with - or are right after known options
-        skip_next = False
-        candidates = []
-        option_with_value = {'-i', '-vf', '-af', '-filter_complex', '-c:v', '-c:a', '-b:v', '-b:a',
-                            '-r', '-s', '-pix_fmt', '-ar', '-ac', '-t', '-ss', '-to', '-map',
-                            '-metadata', '-f', '-codec', '-preset', '-crf', '-qscale'}
-
-        for i, part in enumerate(parts):
-            if skip_next:
-                skip_next = False
-                continue
-            if part.startswith('-'):
-                # Check if this option takes a value
-                if part in option_with_value or '=' not in part:
-                    skip_next = True
-                continue
-            # This is a potential file argument
-            if i > 0:  # Skip the first part (ffmpeg executable)
-                candidates.append(part)
-
-        # Return the last candidate (output file)
-        return candidates[-1] if candidates else ""
 
 
 NODE_CLASS_MAPPINGS.update({"FFmpegExecutor": FFmpegExecutor})
