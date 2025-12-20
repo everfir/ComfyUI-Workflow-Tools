@@ -676,29 +676,38 @@ NODE_DISPLAY_NAME_MAPPINGS.update({"FFmpegExecutor": "FFmpeg Executor"})
 class UploadFileToTOS:
     DESCRIPTION = """
 Upload various file types to Volcengine TOS and return the public URL.
+Supports direct file upload from FFmpegExecutor output or ComfyUI media types.
+
 - Inputs (required):
   - ak / sk / region / bucket: TOS credentials.
   - upload_dir: object key prefix (e.g., "uploads/videos").
+
 - Inputs (optional, at least one):
+  - file_path: STRING path to local file (can connect from FFmpegExecutor.file_path output).
   - image: IMAGE tensor (B,H,W,C in 0-1 float).
   - video: VIDEO dict with frames and fps.
   - audio: AUDIO waveform tensor (channels, samples).
   - sample_rate: INT sample rate (required when audio is provided).
-  - file_path: STRING path to local file.
+
 - Inputs (optional config):
   - endpoint: custom endpoint (default: https://tos-{region}.volces.com).
   - acl: access control (public-read/private/public-read-write).
   - storage_class: storage type (STANDARD/IA/ARCHIVE_FR).
   - content_type: custom Content-Type (auto-detected if empty).
   - custom_filename: custom filename without extension (uses UUID if empty).
+
 - Outputs:
   - url: public-style URL (requires bucket/object ACL to be readable).
   - object_key: key used in the bucket.
+
 - Behavior:
   - Priority: file_path > image > video > audio
   - Auto-detects content type and extension based on input type
   - Supports ACL and storage class configuration
   - Returns both public URL and object key
+
+- Usage Example:
+  FFmpegExecutor.file_path -> UploadFileToTOS.file_path -> url
     """
 
     @classmethod
