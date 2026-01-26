@@ -898,3 +898,446 @@ Supports direct file upload from FFmpegExecutor output or ComfyUI media types.
 
 NODE_CLASS_MAPPINGS.update({"UploadFileToTOS": UploadFileToTOS})
 NODE_DISPLAY_NAME_MAPPINGS.update({"UploadFileToTOS": "Upload File To TOS"})
+
+
+# =============================================================================
+# Metadata Probe Nodes
+# =============================================================================
+
+def _download_to_temp(url: str, suffix: str = "") -> Path:
+    """Download URL to a temporary file and return the path."""
+    request = Request(url, headers={"User-Agent": "ComfyUI-MetadataProbe/1.0"})
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    with contextlib.closing(urlopen(request, timeout=120)) as response:
+        with open(tmp_path, "wb") as handle:
+            shutil.copyfileobj(response, handle, length=1024 * 1024)
+    return tmp_path
+
+
+def _get_resolution_label(height: int) -> str:
+    """Get resolution label based on height."""
+    if height >= 2160:
+        return "4K"
+    elif height >= 1080:
+        return "1080p"
+    elif height >= 720:
+        return "720p"
+    elif height >= 480:
+        return "480p"
+    else:
+        return f"{height}p"
+
+
+def _get_aspect_ratio(width: int, height: int) -> str:
+    """Get aspect ratio string."""
+    from math import gcd
+    if width == 0 or height == 0:
+        return "unknown"
+    divisor = gcd(width, height)
+    w = width // divisor
+    h = height // divisor
+    # Common ratios
+    if (w, h) == (16, 9) or abs(width / height - 16 / 9) < 0.05:
+        return "16:9"
+    elif (w, h) == (9, 16) or abs(width / height - 9 / 16) < 0.05:
+        return "9:16"
+    elif (w, h) == (4, 3) or abs(width / height - 4 / 3) < 0.05:
+        return "4:3"
+    elif (w, h) == (3, 4) or abs(width / height - 3 / 4) < 0.05:
+        return "3:4"
+    elif (w, h) == (1, 1) or abs(width / height - 1) < 0.05:
+        return "1:1"
+    elif (w, h) == (21, 9) or abs(width / height - 21 / 9) < 0.05:
+        return "21:9"
+    else:
+        return f"{w}:{h}"
+
+
+def _put_to_presigned_url(presign_url: str, data: bytes, content_type: str = "image/webp"):
+    """Upload data to a presigned URL using HTTP PUT."""
+    from urllib.request import Request, urlopen
+    request = Request(presign_url, data=data, method="PUT")
+    request.add_header("Content-Type", content_type)
+    request.add_header("Content-Length", str(len(data)))
+    with urlopen(request, timeout=60) as response:
+        if response.status not in (200, 201, 204):
+            raise RuntimeError(f"PUT failed with status {response.status}")
+
+
+def _scale_to_resolution(width: int, height: int, target_resolution: str) -> tuple[int, int]:
+    """Scale dimensions to target resolution while maintaining aspect ratio."""
+    resolution_heights = {
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+        "4K": 2160,
+    }
+    target_height = resolution_heights.get(target_resolution, 480)
+
+    if height <= target_height:
+        return width, height
+
+    scale = target_height / height
+    new_width = int(width * scale)
+    new_height = target_height
+    # Ensure even dimensions for video encoding
+    new_width = new_width - (new_width % 2)
+    new_height = new_height - (new_height % 2)
+    return new_width, new_height
+
+
+class VideoProbeNode:
+    DESCRIPTION = """
+Extract video metadata and generate cover images.
+- Inputs:
+  - url: video URL to probe.
+  - presign_info: JSON array of presigned upload info for covers.
+    Format: [{"resolution": "480p", "presign_url": "...", "cdn_url": "..."}, ...]
+  - webp_quality: WebP image quality (1-100, default 80).
+- Outputs:
+  - metadata_json: JSON string containing video metadata and cover URLs.
+- Behavior:
+  - Downloads video, extracts metadata using ffprobe.
+  - Generates cover images from middle frame.
+  - Uploads covers to presigned URLs.
+  - Returns comprehensive metadata including dimensions, duration, format, and cover URLs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "presign_info": ("STRING", {"default": "[]", "multiline": True}),
+                "webp_quality": ("INT", {"default": 80, "min": 1, "max": 100}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("metadata_json",)
+    FUNCTION = "probe"
+    CATEGORY = "AigcWorkflowTools/Metadata"
+    OUTPUT_NODE = True
+
+    def probe(self, url: str, presign_info: str = "[]", webp_quality: int = 80):
+        import json
+        import subprocess
+        import os
+
+        if not url:
+            raise ValueError("URL cannot be empty.")
+
+        # Download video to temp file
+        tmp_path = _download_to_temp(url, suffix=".mp4")
+        try:
+            # Extract metadata using ffprobe
+            ffprobe_cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_format", "-show_streams", str(tmp_path)
+            ]
+            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffprobe failed: {result.stderr}")
+
+            probe_data = json.loads(result.stdout)
+
+            # Extract video stream info
+            video_stream = None
+            audio_stream = None
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "video" and video_stream is None:
+                    video_stream = stream
+                elif stream.get("codec_type") == "audio" and audio_stream is None:
+                    audio_stream = stream
+
+            if video_stream is None:
+                raise RuntimeError("No video stream found")
+
+            width = video_stream.get("width", 0)
+            height = video_stream.get("height", 0)
+            duration = float(probe_data.get("format", {}).get("duration", 0))
+            size = int(probe_data.get("format", {}).get("size", 0))
+            format_name = probe_data.get("format", {}).get("format_name", "unknown")
+
+            # Generate covers if presign_info is provided
+            covers = []
+            presigns = json.loads(presign_info) if presign_info else []
+
+            if presigns:
+                try:
+                    from PIL import Image
+
+                    # Extract frame from middle of video
+                    middle_time = duration / 2 if duration > 0 else 0
+                    frame_path = tmp_path.with_suffix(".png")
+
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y", "-ss", str(middle_time),
+                        "-i", str(tmp_path), "-vframes", "1",
+                        "-f", "image2", str(frame_path)
+                    ]
+                    subprocess.run(ffmpeg_cmd, capture_output=True, timeout=60)
+
+                    if frame_path.exists():
+                        img = Image.open(frame_path)
+
+                        for presign in presigns:
+                            resolution = presign.get("resolution", "480p")
+                            presign_url = presign.get("presign_url", "")
+                            cdn_url = presign.get("cdn_url", "")
+
+                            if not presign_url or not cdn_url:
+                                continue
+
+                            # Scale image
+                            new_w, new_h = _scale_to_resolution(width, height, resolution)
+                            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+                            # Convert to WebP
+                            buffer = io.BytesIO()
+                            resized.save(buffer, format="WEBP", quality=webp_quality)
+                            buffer.seek(0)
+                            webp_data = buffer.read()
+
+                            # Upload to presigned URL
+                            _put_to_presigned_url(presign_url, webp_data)
+
+                            covers.append({
+                                "url": cdn_url,
+                                "resolution": resolution,
+                                "width": new_w,
+                                "height": new_h,
+                            })
+
+                        frame_path.unlink(missing_ok=True)
+                except Exception as e:
+                    # Cover generation failed, but we still have metadata
+                    pass
+
+            # Build metadata
+            metadata = {
+                "width": width,
+                "height": height,
+                "size": size,
+                "duration": duration,
+                "has_audio": audio_stream is not None,
+                "format": format_name.split(",")[0] if format_name else "unknown",
+                "resolution": _get_resolution_label(height),
+                "aspect_ratio": _get_aspect_ratio(width, height),
+                "covers": covers,
+                "extra": {},
+            }
+
+            metadata_json = json.dumps(metadata)
+            return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
+
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+
+class ImageProbeNode:
+    DESCRIPTION = """
+Extract image metadata and generate thumbnails.
+- Inputs:
+  - url: image URL to probe.
+  - presign_info: JSON array of presigned upload info for thumbnails.
+    Format: [{"resolution": "480p", "presign_url": "...", "cdn_url": "..."}, ...]
+  - webp_quality: WebP image quality (1-100, default 85).
+- Outputs:
+  - metadata_json: JSON string containing image metadata and thumbnail URLs.
+- Behavior:
+  - Downloads image, extracts metadata using PIL.
+  - Generates thumbnails at specified resolutions.
+  - Uploads thumbnails to presigned URLs.
+  - Returns comprehensive metadata including dimensions, format, and thumbnail URLs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "presign_info": ("STRING", {"default": "[]", "multiline": True}),
+                "webp_quality": ("INT", {"default": 85, "min": 1, "max": 100}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("metadata_json",)
+    FUNCTION = "probe"
+    CATEGORY = "AigcWorkflowTools/Metadata"
+    OUTPUT_NODE = True
+
+    def probe(self, url: str, presign_info: str = "[]", webp_quality: int = 85):
+        import json
+        import os
+
+        if not url:
+            raise ValueError("URL cannot be empty.")
+
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("ImageProbeNode requires pillow.") from exc
+
+        # Download image to temp file
+        tmp_path = _download_to_temp(url)
+        try:
+            # Get file size
+            size = os.path.getsize(tmp_path)
+
+            # Open image and extract metadata
+            img = Image.open(tmp_path)
+            width, height = img.size
+            format_name = img.format.lower() if img.format else "unknown"
+
+            # Generate thumbnails if presign_info is provided
+            thumbnails = []
+            presigns = json.loads(presign_info) if presign_info else []
+
+            for presign in presigns:
+                resolution = presign.get("resolution", "480p")
+                presign_url = presign.get("presign_url", "")
+                cdn_url = presign.get("cdn_url", "")
+
+                if not presign_url or not cdn_url:
+                    continue
+
+                try:
+                    # Scale image
+                    new_w, new_h = _scale_to_resolution(width, height, resolution)
+                    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+                    # Convert to WebP
+                    buffer = io.BytesIO()
+                    resized.save(buffer, format="WEBP", quality=webp_quality)
+                    buffer.seek(0)
+                    webp_data = buffer.read()
+
+                    # Upload to presigned URL
+                    _put_to_presigned_url(presign_url, webp_data)
+
+                    thumbnails.append({
+                        "url": cdn_url,
+                        "resolution": resolution,
+                        "width": new_w,
+                        "height": new_h,
+                    })
+                except Exception:
+                    # Thumbnail generation failed for this resolution, skip
+                    continue
+
+            # Build metadata
+            metadata = {
+                "width": width,
+                "height": height,
+                "size": size,
+                "format": format_name,
+                "resolution": _get_resolution_label(height),
+                "aspect_ratio": _get_aspect_ratio(width, height),
+                "thumbnails": thumbnails,
+                "extra": {},
+            }
+
+            metadata_json = json.dumps(metadata)
+            return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
+
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+
+class AudioProbeNode:
+    DESCRIPTION = """
+Extract audio metadata.
+- Inputs:
+  - url: audio URL to probe.
+- Outputs:
+  - metadata_json: JSON string containing audio metadata.
+- Behavior:
+  - Downloads audio, extracts metadata using ffprobe.
+  - Returns metadata including duration, format, and file size.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("metadata_json",)
+    FUNCTION = "probe"
+    CATEGORY = "AigcWorkflowTools/Metadata"
+    OUTPUT_NODE = True
+
+    def probe(self, url: str):
+        import json
+        import subprocess
+        import os
+
+        if not url:
+            raise ValueError("URL cannot be empty.")
+
+        # Download audio to temp file
+        tmp_path = _download_to_temp(url)
+        try:
+            # Get file size
+            size = os.path.getsize(tmp_path)
+
+            # Extract metadata using ffprobe
+            ffprobe_cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_format", "-show_streams", str(tmp_path)
+            ]
+            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffprobe failed: {result.stderr}")
+
+            probe_data = json.loads(result.stdout)
+
+            # Extract audio stream info
+            audio_stream = None
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "audio":
+                    audio_stream = stream
+                    break
+
+            duration = float(probe_data.get("format", {}).get("duration", 0))
+            format_name = probe_data.get("format", {}).get("format_name", "unknown")
+
+            # Build metadata
+            metadata = {
+                "duration": duration,
+                "format": format_name.split(",")[0] if format_name else "unknown",
+                "size": size,
+                "word_count": 0,  # Placeholder, TTS scenarios may populate this
+                "extra": {},
+            }
+
+            metadata_json = json.dumps(metadata)
+            return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
+
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+
+
+NODE_CLASS_MAPPINGS.update({
+    "VideoProbeNode": VideoProbeNode,
+    "ImageProbeNode": ImageProbeNode,
+    "AudioProbeNode": AudioProbeNode,
+})
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "VideoProbeNode": "Video Probe",
+    "ImageProbeNode": "Image Probe",
+    "AudioProbeNode": "Audio Probe",
+})
