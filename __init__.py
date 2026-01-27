@@ -1042,7 +1042,7 @@ Extract video metadata and generate cover images.
 - Outputs:
   - metadata_json: JSON string containing video metadata and cover URLs.
 - Behavior:
-  - Downloads video, extracts metadata using ffprobe.
+  - Uses ffprobe/ffmpeg directly on URL (no full download needed).
   - Generates cover images from middle frame.
   - Uploads covers to presigned URLs.
   - Returns comprehensive metadata including dimensions, duration, format, and cover URLs.
@@ -1069,119 +1069,131 @@ Extract video metadata and generate cover images.
     def probe(self, url: str, presign_info: str = "[]", webp_quality: int = 80):
         import json
         import subprocess
-        import os
 
         if not url:
             raise ValueError("URL cannot be empty.")
 
-        # Download video to temp file
-        tmp_path = _download_to_temp(url, suffix=".mp4")
-        try:
-            # Extract metadata using ffprobe
-            ffprobe_cmd = [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_format", "-show_streams", str(tmp_path)
-            ]
-            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                raise RuntimeError(f"ffprobe failed: {result.stderr}")
+        # ============================================================
+        # Step 1: Extract metadata using ffprobe directly on URL
+        # ffprobe only reads headers/metadata, no full download needed
+        # ============================================================
+        ffprobe_cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams",
+            "-user_agent", "ComfyUI-MetadataProbe/1.0",
+            url  # Direct URL access
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffprobe failed: {result.stderr}")
 
-            probe_data = json.loads(result.stdout)
+        probe_data = json.loads(result.stdout)
 
-            # Extract video stream info
-            video_stream = None
-            audio_stream = None
-            for stream in probe_data.get("streams", []):
-                if stream.get("codec_type") == "video" and video_stream is None:
-                    video_stream = stream
-                elif stream.get("codec_type") == "audio" and audio_stream is None:
-                    audio_stream = stream
+        # Extract video stream info
+        video_stream = None
+        audio_stream = None
+        for stream in probe_data.get("streams", []):
+            if stream.get("codec_type") == "video" and video_stream is None:
+                video_stream = stream
+            elif stream.get("codec_type") == "audio" and audio_stream is None:
+                audio_stream = stream
 
-            if video_stream is None:
-                raise RuntimeError("No video stream found")
+        if video_stream is None:
+            raise RuntimeError("No video stream found")
 
-            width = video_stream.get("width", 0)
-            height = video_stream.get("height", 0)
-            duration = float(probe_data.get("format", {}).get("duration", 0))
-            size = int(probe_data.get("format", {}).get("size", 0))
-            raw_format = probe_data.get("format", {}).get("format_name", "unknown")
-            format_name = _normalize_format(raw_format, url)
+        width = video_stream.get("width", 0)
+        height = video_stream.get("height", 0)
+        duration = float(probe_data.get("format", {}).get("duration", 0))
+        size = int(probe_data.get("format", {}).get("size", 0))
+        raw_format = probe_data.get("format", {}).get("format_name", "unknown")
+        format_name = _normalize_format(raw_format, url)
 
-            # Generate covers if presign_info is provided
-            covers = []
-            presigns = json.loads(presign_info) if presign_info else []
+        # ============================================================
+        # Step 2: Generate covers if presign_info is provided
+        # Use ffmpeg with -ss BEFORE -i for fast seeking on URL
+        # ============================================================
+        covers = []
+        presigns = json.loads(presign_info) if presign_info else []
+        frame_path = None
 
-            if presigns:
-                try:
-                    from PIL import Image
+        if presigns:
+            try:
+                from PIL import Image
 
-                    # Extract frame from middle of video
-                    middle_time = duration / 2 if duration > 0 else 0
-                    frame_path = tmp_path.with_suffix(".png")
+                # Create temp file for extracted frame only
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    frame_path = Path(tmp.name)
 
-                    ffmpeg_cmd = [
-                        "ffmpeg", "-y", "-ss", str(middle_time),
-                        "-i", str(tmp_path), "-vframes", "1",
-                        "-f", "image2", str(frame_path)
-                    ]
-                    subprocess.run(ffmpeg_cmd, capture_output=True, timeout=60)
+                # Extract frame from middle of video
+                # -ss BEFORE -i enables fast seeking (input seeking)
+                middle_time = duration / 2 if duration > 0 else 0
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(middle_time),  # Seek BEFORE input (fast)
+                    "-user_agent", "ComfyUI-MetadataProbe/1.0",
+                    "-i", url,                 # Direct URL access
+                    "-vframes", "1",
+                    "-f", "image2",
+                    str(frame_path)
+                ]
+                subprocess.run(ffmpeg_cmd, capture_output=True, timeout=30)
 
-                    if frame_path.exists():
-                        img = Image.open(frame_path)
+                if frame_path.exists() and frame_path.stat().st_size > 0:
+                    img = Image.open(frame_path)
 
-                        for presign in presigns:
-                            resolution = presign.get("resolution", "480p")
-                            presign_url = presign.get("presign_url", "")
-                            cdn_url = presign.get("cdn_url", "")
+                    for presign in presigns:
+                        resolution = presign.get("resolution", "480p")
+                        presign_url = presign.get("presign_url", "")
+                        cdn_url = presign.get("cdn_url", "")
 
-                            if not presign_url or not cdn_url:
-                                continue
+                        if not presign_url or not cdn_url:
+                            continue
 
-                            # Scale image
-                            new_w, new_h = _scale_to_resolution(width, height, resolution)
-                            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                        # Scale image
+                        new_w, new_h = _scale_to_resolution(width, height, resolution)
+                        resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-                            # Convert to WebP
-                            buffer = io.BytesIO()
-                            resized.save(buffer, format="WEBP", quality=webp_quality)
-                            buffer.seek(0)
-                            webp_data = buffer.read()
+                        # Convert to WebP
+                        buffer = io.BytesIO()
+                        resized.save(buffer, format="WEBP", quality=webp_quality)
+                        buffer.seek(0)
+                        webp_data = buffer.read()
 
-                            # Upload to presigned URL
-                            _put_to_presigned_url(presign_url, webp_data)
+                        # Upload to presigned URL
+                        _put_to_presigned_url(presign_url, webp_data)
 
-                            covers.append({
-                                "url": cdn_url,
-                                "resolution": resolution,
-                                "width": new_w,
-                                "height": new_h,
-                            })
+                        covers.append({
+                            "url": cdn_url,
+                            "resolution": resolution,
+                            "width": new_w,
+                            "height": new_h,
+                        })
 
-                        frame_path.unlink(missing_ok=True)
-                except Exception as e:
-                    # Cover generation failed, but we still have metadata
-                    pass
+                    img.close()
+            except Exception:
+                # Cover generation failed, but we still have metadata
+                pass
+            finally:
+                if frame_path:
+                    with contextlib.suppress(FileNotFoundError):
+                        frame_path.unlink()
 
-            # Build metadata
-            metadata = {
-                "width": width,
-                "height": height,
-                "size": size,
-                "duration": duration,
-                "has_audio": audio_stream is not None,
-                "format": format_name,
-                "resolution": _get_resolution_label(height),
-                "aspect_ratio": _get_aspect_ratio(width, height),
-                "covers": covers,
-                "extra": {},
-            }
+        # Build metadata
+        metadata = {
+            "width": width,
+            "height": height,
+            "size": size,
+            "duration": duration,
+            "has_audio": audio_stream is not None,
+            "format": format_name,
+            "resolution": _get_resolution_label(height),
+            "aspect_ratio": _get_aspect_ratio(width, height),
+            "covers": covers,
+            "extra": {},
+        }
 
-            metadata_json = json.dumps(metadata)
-            return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
-
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                tmp_path.unlink()
+        metadata_json = json.dumps(metadata)
+        return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
 
 
 class ImageProbeNode:
@@ -1306,7 +1318,7 @@ Extract audio metadata.
 - Outputs:
   - metadata_json: JSON string containing audio metadata.
 - Behavior:
-  - Downloads audio, extracts metadata using ffprobe.
+  - Uses ffprobe directly on URL (no full download needed).
   - Returns metadata including duration, format, and file size.
     """
 
@@ -1327,54 +1339,47 @@ Extract audio metadata.
     def probe(self, url: str):
         import json
         import subprocess
-        import os
 
         if not url:
             raise ValueError("URL cannot be empty.")
 
-        # Download audio to temp file
-        tmp_path = _download_to_temp(url)
-        try:
-            # Get file size
-            size = os.path.getsize(tmp_path)
+        # Extract metadata using ffprobe directly on URL
+        # ffprobe only reads headers/metadata, no full download needed
+        ffprobe_cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams",
+            "-user_agent", "ComfyUI-MetadataProbe/1.0",
+            url  # Direct URL access
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffprobe failed: {result.stderr}")
 
-            # Extract metadata using ffprobe
-            ffprobe_cmd = [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_format", "-show_streams", str(tmp_path)
-            ]
-            result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                raise RuntimeError(f"ffprobe failed: {result.stderr}")
+        probe_data = json.loads(result.stdout)
 
-            probe_data = json.loads(result.stdout)
+        # Extract audio stream info
+        audio_stream = None
+        for stream in probe_data.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                audio_stream = stream
+                break
 
-            # Extract audio stream info
-            audio_stream = None
-            for stream in probe_data.get("streams", []):
-                if stream.get("codec_type") == "audio":
-                    audio_stream = stream
-                    break
+        duration = float(probe_data.get("format", {}).get("duration", 0))
+        size = int(probe_data.get("format", {}).get("size", 0))
+        raw_format = probe_data.get("format", {}).get("format_name", "unknown")
+        format_name = _normalize_format(raw_format, url)
 
-            duration = float(probe_data.get("format", {}).get("duration", 0))
-            raw_format = probe_data.get("format", {}).get("format_name", "unknown")
-            format_name = _normalize_format(raw_format, url)
+        # Build metadata
+        metadata = {
+            "duration": duration,
+            "format": format_name,
+            "size": size,
+            "word_count": 0,  # Placeholder, TTS scenarios may populate this
+            "extra": {},
+        }
 
-            # Build metadata
-            metadata = {
-                "duration": duration,
-                "format": format_name,
-                "size": size,
-                "word_count": 0,  # Placeholder, TTS scenarios may populate this
-                "extra": {},
-            }
-
-            metadata_json = json.dumps(metadata)
-            return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
-
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                tmp_path.unlink()
+        metadata_json = json.dumps(metadata)
+        return {"ui": {"text": [metadata_json]}, "result": (metadata_json,)}
 
 
 NODE_CLASS_MAPPINGS.update({
