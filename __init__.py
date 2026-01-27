@@ -987,6 +987,50 @@ def _scale_to_resolution(width: int, height: int, target_resolution: str) -> tup
     return new_width, new_height
 
 
+def _normalize_format(format_name: str, url: str = "") -> str:
+    """Normalize format name to user-friendly format.
+
+    FFprobe reports container format like "mov,mp4,m4a,3gp,3g2,mj2" for MP4 files.
+    This function normalizes it to a user-friendly format name.
+    """
+    if not format_name or format_name == "unknown":
+        # Fallback to URL extension
+        if url:
+            ext = Path(urlparse(url).path).suffix.lstrip(".").lower()
+            if ext:
+                return ext
+        return "unknown"
+
+    format_lower = format_name.lower()
+
+    # Video formats: mov/mp4 family -> mp4
+    if any(f in format_lower for f in ["mp4", "mov", "m4a", "3gp", "3g2"]):
+        return "mp4"
+
+    # Audio formats
+    if "mp3" in format_lower or "mpeg" in format_lower:
+        return "mp3"
+    if "wav" in format_lower:
+        return "wav"
+    if "flac" in format_lower:
+        return "flac"
+    if "ogg" in format_lower:
+        return "ogg"
+    if "aac" in format_lower:
+        return "aac"
+
+    # Other video formats
+    if "webm" in format_lower:
+        return "webm"
+    if "avi" in format_lower:
+        return "avi"
+    if "mkv" in format_lower or "matroska" in format_lower:
+        return "mkv"
+
+    # Return first format if comma-separated
+    return format_name.split(",")[0].strip()
+
+
 class VideoProbeNode:
     DESCRIPTION = """
 Extract video metadata and generate cover images.
@@ -1060,7 +1104,8 @@ Extract video metadata and generate cover images.
             height = video_stream.get("height", 0)
             duration = float(probe_data.get("format", {}).get("duration", 0))
             size = int(probe_data.get("format", {}).get("size", 0))
-            format_name = probe_data.get("format", {}).get("format_name", "unknown")
+            raw_format = probe_data.get("format", {}).get("format_name", "unknown")
+            format_name = _normalize_format(raw_format, url)
 
             # Generate covers if presign_info is provided
             covers = []
@@ -1124,7 +1169,7 @@ Extract video metadata and generate cover images.
                 "size": size,
                 "duration": duration,
                 "has_audio": audio_stream is not None,
-                "format": format_name.split(",")[0] if format_name else "unknown",
+                "format": format_name,
                 "resolution": _get_resolution_label(height),
                 "aspect_ratio": _get_aspect_ratio(width, height),
                 "covers": covers,
@@ -1312,12 +1357,13 @@ Extract audio metadata.
                     break
 
             duration = float(probe_data.get("format", {}).get("duration", 0))
-            format_name = probe_data.get("format", {}).get("format_name", "unknown")
+            raw_format = probe_data.get("format", {}).get("format_name", "unknown")
+            format_name = _normalize_format(raw_format, url)
 
             # Build metadata
             metadata = {
                 "duration": duration,
-                "format": format_name.split(",")[0] if format_name else "unknown",
+                "format": format_name,
                 "size": size,
                 "word_count": 0,  # Placeholder, TTS scenarios may populate this
                 "extra": {},
