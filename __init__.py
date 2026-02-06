@@ -1043,7 +1043,7 @@ Extract video metadata and generate cover images.
   - metadata_json: JSON string containing video metadata and cover URLs.
 - Behavior:
   - Uses ffprobe/ffmpeg directly on URL (no full download needed).
-  - Generates cover images from middle frame.
+  - Generates cover images from first frame.
   - Uploads covers to presigned URLs.
   - Returns comprehensive metadata including dimensions, duration, format, and cover URLs.
     """
@@ -1124,12 +1124,10 @@ Extract video metadata and generate cover images.
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                     frame_path = Path(tmp.name)
 
-                # Extract frame from middle of video
-                # -ss BEFORE -i enables fast seeking (input seeking)
-                middle_time = duration / 2 if duration > 0 else 0
+                # Extract first frame of video
                 ffmpeg_cmd = [
                     "ffmpeg", "-y",
-                    "-ss", str(middle_time),  # Seek BEFORE input (fast)
+                    "-ss", "0",  # First frame
                     "-user_agent", "ComfyUI-MetadataProbe/1.0",
                     "-i", url,                 # Direct URL access
                     "-vframes", "1",
