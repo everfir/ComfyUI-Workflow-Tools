@@ -273,8 +273,8 @@ async def _async_ffmpeg_extract_frame(
     url: str,
     output_path: Path,
     timeout: float = 20.0,
-) -> bool:
-    """Extract first frame from video URL.  Returns True on success."""
+) -> None:
+    """Extract first frame from video URL.  Raises on failure."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", "0",
@@ -285,25 +285,20 @@ async def _async_ffmpeg_extract_frame(
         str(output_path),
     ]
 
-    async def _run() -> bool:
+    async def _run() -> None:
         await _async_run_subprocess(
             cmd, timeout=timeout, operation_name="ffmpeg-frame",
         )
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError("ffmpeg produced empty or missing output")
-        return True
 
-    try:
-        return await _retry_async(
-            _run,
-            max_retries=3,
-            base_delay=2.0,
-            retryable_exceptions=(RuntimeError, OSError),
-            operation_name="ffmpeg-frame-extract",
-        )
-    except Exception as exc:
-        logger.warning("Frame extraction failed after retries: %s", exc)
-        return False
+    await _retry_async(
+        _run,
+        max_retries=3,
+        base_delay=2.0,
+        retryable_exceptions=(RuntimeError, OSError),
+        operation_name="ffmpeg-frame-extract",
+    )
 
 
 async def _async_download_to_temp(
@@ -506,80 +501,62 @@ Extract video metadata and generate cover images.
         raw_format = probe_data.get("format", {}).get("format_name", "unknown")
         format_name = _normalize_format(raw_format, url)
 
-        # ── Step 2: Cover generation (optional — failure = degraded output) ──
+        # ── Step 2: Cover generation (critical when presign_info provided) ──
         covers: list[dict] = []
         presigns = json.loads(presign_info) if presign_info else []
 
         if presigns:
-            try:
-                from PIL import Image
+            from PIL import Image
 
+            try:
                 async with AsyncTempFile(suffix=".png") as frame_path:
                     ffmpeg_timeout = budget.allocate(20.0, minimum=5.0)
-                    success = await _async_ffmpeg_extract_frame(
+                    await _async_ffmpeg_extract_frame(
                         url, frame_path, timeout=ffmpeg_timeout,
                     )
-                    if success:
-                        img = Image.open(frame_path)
-                        try:
-                            for presign in presigns:
-                                resolution = presign.get("resolution", "480p")
-                                presign_url = presign.get("presign_url", "")
-                                cdn_url = presign.get("cdn_url", "")
-                                if not presign_url or not cdn_url:
-                                    continue
 
-                                new_w, new_h = _scale_to_resolution(
-                                    width, height, resolution,
-                                )
-                                resized = img.resize(
-                                    (new_w, new_h), Image.Resampling.LANCZOS,
-                                )
-                                buffer = io.BytesIO()
-                                resized.save(
-                                    buffer, format="WEBP", quality=webp_quality,
-                                )
-                                webp_data = buffer.getvalue()
+                    img = Image.open(frame_path)
+                    try:
+                        for presign in presigns:
+                            resolution = presign.get("resolution", "480p")
+                            presign_url = presign.get("presign_url", "")
+                            cdn_url = presign.get("cdn_url", "")
+                            if not presign_url or not cdn_url:
+                                continue
 
-                                try:
-                                    upload_timeout = budget.allocate(
-                                        15.0, minimum=3.0,
-                                    )
-                                    await _retry_async(
-                                        _async_put_to_presigned_url,
-                                        presign_url,
-                                        webp_data,
-                                        timeout=upload_timeout,
-                                        max_retries=3,
-                                        base_delay=1.0,
-                                        operation_name=f"cover-upload-{resolution}",
-                                    )
-                                    covers.append({
-                                        "url": cdn_url,
-                                        "resolution": resolution,
-                                        "width": new_w,
-                                        "height": new_h,
-                                    })
-                                except Exception as exc:
-                                    logger.warning(
-                                        "Cover upload failed for %s: %s",
-                                        resolution, exc,
-                                    )
-                        finally:
-                            img.close()
-                    else:
-                        logger.warning(
-                            "Frame extraction returned no usable frame for %s",
-                            url,
-                        )
-            except TimeoutError as exc:
-                logger.warning(
-                    "Timeout budget exhausted during cover generation: %s", exc,
-                )
+                            new_w, new_h = _scale_to_resolution(
+                                width, height, resolution,
+                            )
+                            resized = img.resize(
+                                (new_w, new_h), Image.Resampling.LANCZOS,
+                            )
+                            buffer = io.BytesIO()
+                            resized.save(
+                                buffer, format="WEBP", quality=webp_quality,
+                            )
+                            webp_data = buffer.getvalue()
+
+                            upload_timeout = budget.allocate(15.0, minimum=3.0)
+                            await _retry_async(
+                                _async_put_to_presigned_url,
+                                presign_url,
+                                webp_data,
+                                timeout=upload_timeout,
+                                max_retries=3,
+                                base_delay=1.0,
+                                operation_name=f"cover-upload-{resolution}",
+                            )
+                            covers.append({
+                                "url": cdn_url,
+                                "resolution": resolution,
+                                "width": new_w,
+                                "height": new_h,
+                            })
+                    finally:
+                        img.close()
             except Exception as exc:
-                logger.warning(
-                    "Cover generation failed for %s: %s", url, exc, exc_info=True,
-                )
+                logger.error("[VideoProbe] Cover generation failed for url=%s: %s", url, exc)
+                raise
 
         metadata = {
             "width": width,
@@ -698,14 +675,14 @@ Extract image metadata and generate thumbnails.
             format_name = img.format.lower() if img.format else "unknown"
 
             thumbnails: list[dict] = []
-            for presign in presigns:
-                resolution = presign.get("resolution", "480p")
-                presign_url = presign.get("presign_url", "")
-                cdn_url = presign.get("cdn_url", "")
-                if not presign_url or not cdn_url:
-                    continue
+            try:
+                for presign in presigns:
+                    resolution = presign.get("resolution", "480p")
+                    presign_url = presign.get("presign_url", "")
+                    cdn_url = presign.get("cdn_url", "")
+                    if not presign_url or not cdn_url:
+                        continue
 
-                try:
                     new_w, new_h = _scale_to_resolution(width, height, resolution)
                     resized = img.resize(
                         (new_w, new_h), Image.Resampling.LANCZOS,
@@ -730,14 +707,11 @@ Extract image metadata and generate thumbnails.
                         "width": new_w,
                         "height": new_h,
                     })
-                except Exception as exc:
-                    logger.warning(
-                        "Thumbnail generation/upload failed for %s: %s",
-                        resolution, exc,
-                    )
-                    continue
-
-            img.close()
+            except Exception as exc:
+                logger.error("[ImageProbe] Thumbnail generation failed for url=%s: %s", url, exc)
+                raise
+            finally:
+                img.close()
 
         metadata = {
             "width": width,
